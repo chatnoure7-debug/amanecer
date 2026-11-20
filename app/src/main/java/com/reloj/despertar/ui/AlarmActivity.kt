@@ -4,6 +4,7 @@ import android.os.Build
 import android.os.Bundle
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
+import androidx.activity.OnBackPressedCallback
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
@@ -53,6 +54,11 @@ class AlarmActivity : ComponentActivity() {
         }
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
+        // La alarma solo se para pulsando Parar: el botón Atrás no hace nada
+        onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+            override fun handleOnBackPressed() {}
+        })
+
         setContent {
             AmanecerTheme {
                 RingScreen(
@@ -99,9 +105,12 @@ private fun RingScreen(onDismiss: () -> Unit, onSnooze: () -> Unit, onFinished: 
         Button(onClick = onDismiss, modifier = Modifier.fillMaxWidth().height(72.dp)) {
             Text("Parar", fontSize = 22.sp)
         }
-        Spacer(Modifier.height(14.dp))
-        OutlinedButton(onClick = onSnooze, modifier = Modifier.fillMaxWidth().height(60.dp)) {
-            Text("Posponer ${ringing?.snoozeMinutes ?: 5} min", fontSize = 18.sp)
+        val snoozeMin = ringing?.snoozeMinutes ?: 0
+        if (snoozeMin > 0) {
+            Spacer(Modifier.height(14.dp))
+            OutlinedButton(onClick = onSnooze, modifier = Modifier.fillMaxWidth().height(60.dp)) {
+                Text("Posponer $snoozeMin min", fontSize = 18.sp)
+            }
         }
     }
 }
