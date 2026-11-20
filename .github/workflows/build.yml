@@ -24,6 +24,21 @@ jobs:
         with:
           gradle-version: 8.9
 
+      - name: Clave de firma fija (para que las actualizaciones se instalen encima)
+        if: github.event_name != 'pull_request'
+        continue-on-error: true
+        run: |
+          if [ ! -f app/amanecer.keystore.b64 ]; then
+            keytool -genkeypair -keystore "$RUNNER_TEMP/amanecer.jks" -storetype JKS -storepass android -keypass android -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 36500 -dname "CN=Amanecer, O=Personal"
+            base64 -w0 "$RUNNER_TEMP/amanecer.jks" > app/amanecer.keystore.b64
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add app/amanecer.keystore.b64
+            git commit -m "Clave de firma fija para las actualizaciones [skip ci]"
+            git pull --rebase origin main
+            git push origin HEAD:main
+          fi
+
       - name: Compilar APK de depuración
         run: gradle assembleDebug --no-daemon
 
