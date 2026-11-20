@@ -1,3 +1,5 @@
+import java.util.Base64
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -12,8 +14,23 @@ android {
         applicationId = "com.reloj.despertar"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.0.0"
+        versionCode = 2
+        versionName = "1.1.0"
+    }
+
+    // Firma fija: así las versiones nuevas se instalan ENCIMA de la anterior sin perder las alarmas.
+    // (La clave está en amanecer.keystore.b64; es la típica de pruebas, solo para instalar a mano.)
+    val keystoreB64 = file("amanecer.keystore.b64")
+    val keystoreFile = layout.buildDirectory.file("amanecer.keystore").get().asFile
+    if (keystoreB64.exists()) {
+        keystoreFile.parentFile.mkdirs()
+        keystoreFile.writeBytes(Base64.getMimeDecoder().decode(keystoreB64.readText()))
+        signingConfigs.getByName("debug") {
+            storeFile = keystoreFile
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
+        }
     }
 
     buildTypes {
