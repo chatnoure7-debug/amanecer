@@ -10,6 +10,18 @@ class AlarmReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         val id = intent.getIntExtra(AlarmScheduler.EXTRA_ID, -1)
         if (id < 0) return
+
+        if (intent.action == AlarmScheduler.ACTION_GUARD) {
+            // Vigilante: solo actúa si la alarma sigue sin parar
+            if (RingGuard.current(context)?.alarmId == id) {
+                val guard = Intent(context, AlarmService::class.java)
+                    .setAction(AlarmService.ACTION_GUARD)
+                    .putExtra(AlarmScheduler.EXTRA_ID, id)
+                ContextCompat.startForegroundService(context, guard)
+            }
+            return
+        }
+
         val snoozed = intent.getBooleanExtra(AlarmScheduler.EXTRA_SNOOZED, false)
         val store = AlarmStore(context)
         val alarm = store.get(id) ?: return

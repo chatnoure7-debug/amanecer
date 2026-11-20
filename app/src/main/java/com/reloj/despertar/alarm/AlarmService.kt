@@ -11,13 +11,13 @@ import android.content.pm.ServiceInfo
 import android.media.AudioAttributes
 import android.media.AudioFocusRequest
 import android.media.AudioManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.PowerManager
-import android.os.VibrationEffect
 import android.os.Vibrator
 import android.speech.tts.TextToSpeech
 import androidx.core.app.NotificationCompat
@@ -25,32 +25,46 @@ import androidx.core.app.ServiceCompat
 import com.reloj.despertar.R
 import com.reloj.despertar.data.Alarm
 import com.reloj.despertar.data.AlarmStore
+import com.reloj.despertar.sound.FileSoundPlayer
+import com.reloj.despertar.sound.RingSound
+import com.reloj.despertar.sound.Sounds
 import com.reloj.despertar.sound.WakeSoundPlayer
 import com.reloj.despertar.ui.AlarmActivity
 import java.util.Locale
-import kotlin.math.roundToInt
 
 /**
  * Servicio en primer plano que vive SOLO mientras suena la alarma.
- * Al parar (o a los 20 min) se detiene y libera todo: audio, vibración, wake lock, TTS y volumen.
+ *
+ * NO se para solo: sigue sonando hasta que se pulsa Parar (o Posponer). Para que no falle:
+ *  - anota en disco que está sonando (RingGuard) y programa una alarma de respaldo del sistema cada pocos segundos;
+ *    si Android mata el servicio, esa alarma lo vuelve a levantar y retoma la subida por donde iba;
+ *  - cada 20 s comprueba que el sonido sigue vivo y, si no, lo reinicia;
+ *  - mantiene el móvil despierto con un wake lock que se renueva.
+ * Al parar libera todo: audio, vibración, wake lock, voz, respaldo y volumen.
  */
 class AlarmService : Service() {
 
-    private var player: WakeSoundPlayer? = null
+    private var player: RingSound? = null
     private var wakeLock: PowerManager.WakeLock? = null
     private var tts: TextToSpeech? = null
     private var ttsReady = false
     private var focusRequest: AudioFocusRequest? = null
     private var originalVolume = -1
     private var current: Alarm? = null
+    private var startedAtMs = 0L
     private val handler = Handler(Looper.getMainLooper())
 
-    private val timeoutRunnable = Runnable { stopRinging(missed = true) }
     private val vibrateRunnable = Runnable { startVibration() }
     private val greetingRunnable = object : Runnable {
         override fun run() {
             speakGreeting()
             handler.postDelayed(this, GREETING_EVERY_MS)
+        }
+    }
+    private val healthRunnable = object : Runnable {
+        override fun run() {
+            healthCheck()
+            handler.postDelayed(this, HEALTH_EVERY_MS)
         }
     }
 
@@ -64,31 +78,52 @@ class AlarmService : Service() {
                 if (alarm == null) {
                     // Hay que llamar a startForeground igualmente (se arrancó con startForegroundService)
                     enterForeground(fallbackNotification())
-                    stopRinging(missed = false)
+                    stopRinging()
                 } else {
-                    startRinging(alarm)
+                    startRinging(alarm, System.currentTimeMillis(), null)
                 }
             }
-            ACTION_DISMISS -> stopRinging(missed = false)
+            ACTION_DISMISS -> stopRinging()
             ACTION_SNOOZE -> {
-                current?.let { AlarmScheduler.scheduleSnooze(this, it) }
-                stopRinging(missed = false)
+                current?.let { if (it.snoozeMinutes > 0) AlarmScheduler.scheduleSnooze(this, it) }
+                stopRinging()
             }
-            else -> stopSelf()
+            // ACTION_GUARD (alarma de respaldo) o reinicio del servicio por parte del sistema (intent nulo)
+            else -> guard()
         }
-        return START_NOT_STICKY
+        return START_STICKY
     }
 
-    private fun startRinging(alarm: Alarm) {
+    private fun guard() {
+        val rec = RingGuard.current(this)
+        val alarm = rec?.let { AlarmStore(this).get(it.alarmId) }
+        if (rec == null || alarm == null) {
+            // Nada que vigilar
+            enterForeground(fallbackNotification())
+            stopRinging()
+            return
+        }
+        val running = current
+        if (running == null) {
+            // El servicio había muerto: retomar la alarma por donde iba
+            startRinging(alarm, rec.startedAtMs, rec.originalVolume)
+        } else {
+            enterForeground(buildNotification(running))
+            healthCheck()
+        }
+    }
+
+    private fun startRinging(alarm: Alarm, startedAt: Long, savedVolume: Int?) {
         releaseResources() // por si había otra sonando
         current = alarm
+        startedAtMs = startedAt
 
         AlarmState.ringing = Ringing(
             alarmId = alarm.id,
             label = alarm.label,
             hour = alarm.hour,
             minute = alarm.minute,
-            startedAtMs = System.currentTimeMillis(),
+            startedAtMs = startedAt,
             rampSeconds = alarm.rampSeconds,
             snoozeMinutes = alarm.snoozeMinutes,
         )
@@ -96,29 +131,37 @@ class AlarmService : Service() {
 
         val pm = getSystemService(PowerManager::class.java)
         wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "amanecer:ring").apply {
-            acquire(MAX_RING_MS + 60_000)
+            setReferenceCounted(false)
+            acquire(WAKELOCK_MS)
         }
 
-        setAlarmVolume(alarm.volumePercent)
+        val old = AlarmVolume.raiseTo(this, alarm.volumePercent)
+        originalVolume = savedVolume ?: old
+        RingGuard.begin(this, alarm.id, startedAt, originalVolume)
         requestAudioFocus()
 
-        player = WakeSoundPlayer(alarm.rampSeconds).also { it.start() }
+        startSound(alarm)
 
-        if (alarm.vibrate) {
-            // La vibración entra al 70 % de la rampa: ya es tiempo de insistir
-            handler.postDelayed(vibrateRunnable, (alarm.rampSeconds * 700L))
+        if (alarm.vibLevel > 0) {
+            // La vibración entra cuando la subida llega a su punto elegido
+            val startMs = alarm.rampSeconds * alarm.vibStartPercent * 10L
+            val delayMs = (startMs - (elapsedSeconds() * 1000).toLong()).coerceAtLeast(0L)
+            handler.postDelayed(vibrateRunnable, delayMs)
         }
         if (alarm.speakGreeting) initTts(alarm)
 
-        handler.postDelayed(timeoutRunnable, MAX_RING_MS)
+        AlarmScheduler.scheduleGuard(this, alarm.id, GUARD_MS)
+        handler.postDelayed(healthRunnable, HEALTH_EVERY_MS)
     }
 
-    private fun stopRinging(missed: Boolean) {
-        val alarm = current
+    /** Solo se llama al pulsar Parar o Posponer. */
+    private fun stopRinging() {
+        val id = current?.id ?: RingGuard.current(this)?.alarmId
+        RingGuard.clear(this)
+        if (id != null) AlarmScheduler.cancelGuard(this, id)
         releaseResources()
         AlarmState.ringing = null
         ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
-        if (missed && alarm != null) postMissedNotification(alarm)
         stopSelf()
     }
 
@@ -133,10 +176,7 @@ class AlarmService : Service() {
         focusRequest?.let { getSystemService(AudioManager::class.java).abandonAudioFocusRequest(it) }
         focusRequest = null
         if (originalVolume >= 0) {
-            try {
-                getSystemService(AudioManager::class.java)
-                    .setStreamVolume(AudioManager.STREAM_ALARM, originalVolume, 0)
-            } catch (_: SecurityException) { }
+            AlarmVolume.restore(this, originalVolume)
             originalVolume = -1
         }
         wakeLock?.let { if (it.isHeld) it.release() }
@@ -149,18 +189,42 @@ class AlarmService : Service() {
         super.onDestroy()
     }
 
+    // ---------- vigilante ----------
+
+    private fun elapsedSeconds(): Double =
+        ((System.currentTimeMillis() - startedAtMs) / 1000.0).coerceAtLeast(0.0)
+
+    private fun healthCheck() {
+        val a = current ?: return
+        val p = player
+        if (p == null || !p.isAlive()) startSound(a)
+        wakeLock?.acquire(WAKELOCK_MS)
+        AlarmScheduler.scheduleGuard(this, a.id, GUARD_MS)
+    }
+
     // ---------- audio / vibración / voz ----------
 
-    private fun setAlarmVolume(percent: Int) {
-        val am = getSystemService(AudioManager::class.java)
-        try {
-            originalVolume = am.getStreamVolume(AudioManager.STREAM_ALARM)
-            val max = am.getStreamMaxVolume(AudioManager.STREAM_ALARM)
-            val target = (max * percent / 100f).roundToInt().coerceIn(1, max)
-            am.setStreamVolume(AudioManager.STREAM_ALARM, target, 0)
-        } catch (_: SecurityException) {
-            originalVolume = -1
+    private fun startSound(alarm: Alarm) {
+        player?.stop()
+        val offset = elapsedSeconds()
+        val p: RingSound = if (alarm.sound == Sounds.FILE && alarm.soundUri.isNotBlank()) {
+            // Si el archivo falla, suena el sonido de la app: la alarma nunca queda muda
+            FileSoundPlayer(applicationContext, Uri.parse(alarm.soundUri), alarm.rampSeconds, offset) {
+                handler.post { fallbackSound() }
+            }
+        } else {
+            WakeSoundPlayer(alarm.rampSeconds, alarm.sound, offset)
         }
+        player = p
+        p.start()
+    }
+
+    private fun fallbackSound() {
+        val a = current ?: return
+        player?.stop()
+        val p = WakeSoundPlayer(a.rampSeconds, Sounds.DEFAULT, elapsedSeconds())
+        player = p
+        p.start()
     }
 
     private fun requestAudioFocus() {
@@ -172,6 +236,7 @@ class AlarmService : Service() {
                     .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
                     .build()
             )
+            // Se ignora cualquier pérdida de foco: la alarma sigue sonando pase lo que pase
             .setOnAudioFocusChangeListener { }
             .build()
         am.requestAudioFocus(req)
@@ -180,10 +245,10 @@ class AlarmService : Service() {
 
     @Suppress("DEPRECATION")
     private fun startVibration() {
+        val a = current ?: return
         val v = getSystemService(Vibrator::class.java) ?: return
         if (!v.hasVibrator()) return
-        // 0,4 s vibra, 1,1 s pausa; se repite hasta parar
-        val effect = VibrationEffect.createWaveform(longArrayOf(0, 400, 1100), 0)
+        val effect = Vibe.repeating(a.vibLevel, v.hasAmplitudeControl()) ?: return
         v.vibrate(
             effect,
             AudioAttributes.Builder()
@@ -198,8 +263,8 @@ class AlarmService : Service() {
             if (status == TextToSpeech.SUCCESS) {
                 tts?.let {
                     it.setLanguage(Locale("es", "ES"))
-                    it.setPitch(0.9f)         // voz algo más grave
-                    it.setSpeechRate(0.85f)   // y pausada
+                    it.setPitch(alarm.voicePitch / 100f)
+                    it.setSpeechRate(alarm.voiceRate / 100f)
                     it.setAudioAttributes(
                         AudioAttributes.Builder()
                             .setUsage(AudioAttributes.USAGE_ALARM)
@@ -209,7 +274,9 @@ class AlarmService : Service() {
                 }
                 ttsReady = true
                 // La voz entra cuando la rampa va por el 85 %
-                handler.postDelayed(greetingRunnable, alarm.rampSeconds * 850L)
+                val startMs = alarm.rampSeconds * 850L
+                val delayMs = (startMs - (elapsedSeconds() * 1000).toLong()).coerceAtLeast(0L)
+                handler.postDelayed(greetingRunnable, delayMs)
             }
         }
     }
@@ -217,8 +284,7 @@ class AlarmService : Service() {
     private fun speakGreeting() {
         val a = current ?: return
         if (!ttsReady) return
-        val minutes = if (a.minute == 0) "en punto" else "y ${a.minute}"
-        tts?.speak("Buenos días. Son las ${a.hour} $minutes.", TextToSpeech.QUEUE_FLUSH, Bundle(), "greeting")
+        tts?.speak(a.spokenText(), TextToSpeech.QUEUE_FLUSH, Bundle(), "greeting")
     }
 
     // ---------- notificaciones ----------
@@ -236,7 +302,7 @@ class AlarmService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
         val title = alarm.label.ifBlank { "Despertar" }
-        return NotificationCompat.Builder(this, CHANNEL_ID)
+        val b = NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_stat_alarm)
             .setContentTitle(title)
             .setContentText("%02d:%02d".format(alarm.hour, alarm.minute))
@@ -245,9 +311,11 @@ class AlarmService : Service() {
             .setOngoing(true)
             .setContentIntent(open)
             .setFullScreenIntent(open, true)
-            .addAction(0, "Posponer ${alarm.snoozeMinutes} min", servicePending(ACTION_SNOOZE, 1))
-            .addAction(0, "Parar", servicePending(ACTION_DISMISS, 2))
-            .build()
+        if (alarm.snoozeMinutes > 0) {
+            b.addAction(0, "Posponer ${alarm.snoozeMinutes} min", servicePending(ACTION_SNOOZE, 1))
+        }
+        b.addAction(0, "Parar", servicePending(ACTION_DISMISS, 2))
+        return b.build()
     }
 
     private fun fallbackNotification(): Notification =
@@ -255,17 +323,6 @@ class AlarmService : Service() {
             .setSmallIcon(R.drawable.ic_stat_alarm)
             .setContentTitle("Alarma")
             .build()
-
-    private fun postMissedNotification(alarm: Alarm) {
-        ensureChannel()
-        val n = NotificationCompat.Builder(this, CHANNEL_ID)
-            .setSmallIcon(R.drawable.ic_stat_alarm)
-            .setContentTitle("Alarma sin parar")
-            .setContentText("Sonó a las %02d:%02d".format(alarm.hour, alarm.minute))
-            .setAutoCancel(true)
-            .build()
-        getSystemService(NotificationManager::class.java).notify(NOTIF_ID + 1, n)
-    }
 
     private fun servicePending(action: String, code: Int): PendingIntent =
         PendingIntent.getService(
@@ -289,10 +346,13 @@ class AlarmService : Service() {
         const val ACTION_START = "com.reloj.despertar.START"
         const val ACTION_DISMISS = "com.reloj.despertar.DISMISS"
         const val ACTION_SNOOZE = "com.reloj.despertar.SNOOZE"
+        const val ACTION_GUARD = "com.reloj.despertar.GUARD_SERVICE"
         private const val CHANNEL_ID = "ringing"
         private const val NOTIF_ID = 1001
-        private const val MAX_RING_MS = 20 * 60 * 1000L
         private const val GREETING_EVERY_MS = 25_000L
+        private const val HEALTH_EVERY_MS = 20_000L
+        private const val GUARD_MS = 60_000L
+        private const val WAKELOCK_MS = 10 * 60 * 1000L
 
         fun stopIntent(context: Context): Intent =
             Intent(context, AlarmService::class.java).setAction(ACTION_DISMISS)

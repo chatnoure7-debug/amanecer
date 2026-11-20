@@ -19,9 +19,11 @@ import java.time.ZonedDateTime
  */
 object AlarmScheduler {
     const val ACTION_FIRE = "com.reloj.despertar.FIRE"
+    const val ACTION_GUARD = "com.reloj.despertar.GUARD"
     const val EXTRA_ID = "alarm_id"
     const val EXTRA_SNOOZED = "snoozed"
     private const val SNOOZE_REQUEST_BASE = 100_000
+    private const val GUARD_REQUEST_BASE = 200_000
 
     fun schedule(context: Context, alarm: Alarm) {
         if (!alarm.enabled) {
@@ -35,6 +37,28 @@ object AlarmScheduler {
     fun scheduleSnooze(context: Context, alarm: Alarm) {
         val at = ZonedDateTime.now().plusMinutes(alarm.snoozeMinutes.toLong())
         setClock(context, SNOOZE_REQUEST_BASE + alarm.id, at, snoozed = true, alarmId = alarm.id)
+    }
+
+    /**
+     * Alarma de respaldo mientras suena: si Android mata el servicio, esta alarma del sistema lo vuelve a levantar.
+     * El servicio la renueva cada pocos segundos; al pulsar Parar se cancela.
+     */
+    fun scheduleGuard(context: Context, alarmId: Int, delayMs: Long) {
+        val am = context.getSystemService(AlarmManager::class.java)
+        val show = PendingIntent.getActivity(
+            context, 0, Intent(context, MainActivity::class.java),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        val info = AlarmManager.AlarmClockInfo(System.currentTimeMillis() + delayMs, show)
+        try {
+            am.setAlarmClock(info, guardPending(context, alarmId))
+        } catch (e: SecurityException) {
+            Log.w("AlarmScheduler", "No se puede programar el vigilante", e)
+        }
+    }
+
+    fun cancelGuard(context: Context, alarmId: Int) {
+        context.getSystemService(AlarmManager::class.java).cancel(guardPending(context, alarmId))
     }
 
     fun cancel(context: Context, alarmId: Int) {
@@ -76,6 +100,17 @@ object AlarmScheduler {
             .putExtra(EXTRA_SNOOZED, snoozed)
         return PendingIntent.getBroadcast(
             context, requestCode, intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+    }
+
+    private fun guardPending(context: Context, alarmId: Int): PendingIntent {
+        val intent = Intent(context, AlarmReceiver::class.java)
+            .setAction(ACTION_GUARD)
+            .setData(Uri.parse("amanecer://guard/$alarmId"))
+            .putExtra(EXTRA_ID, alarmId)
+        return PendingIntent.getBroadcast(
+            context, GUARD_REQUEST_BASE + alarmId, intent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
     }
