@@ -70,4 +70,49 @@ class LogicTest {
         val now = ZonedDateTime.of(2026, 11, 20, 6, 0, 0, 0, madrid) // justo ahora: ya no es futuro
         assertEquals(21, Schedule.nextTrigger(alarm, now).dayOfMonth)
     }
+
+    @Test
+    fun everyPresetIsFiniteBoundedAndGetsLouder() {
+        val sr = 22050
+        for (preset in listOf("amanecer", "arpa", "campanas", "calido", "bosque", "olas")) {
+            val synth = WakeSynth(30.0, sr, preset)
+            val buf = FloatArray(sr)
+            val rms = DoubleArray(30)
+            for (sec in 0 until 30) {
+                synth.render(buf, buf.size)
+                var sum = 0.0
+                for (v in buf) {
+                    assertFalse(v.isNaN())
+                    assertTrue(abs(v) <= 1.0f)
+                    sum += v * v
+                }
+                rms[sec] = sqrt(sum / buf.size)
+            }
+            assertTrue("${preset}: arranca casi en silencio", rms[1] < 0.01)
+            assertTrue("${preset}: acaba claramente audible", rms[28] > 0.02)
+        }
+    }
+
+    @Test
+    fun resumingWithOffsetContinuesWhereItWas() {
+        val sr = 22050
+        val fresh = WakeSynth(60.0, sr, "amanecer", 0.0)
+        val resumed = WakeSynth(60.0, sr, "amanecer", 50.0)
+        val a = FloatArray(sr)
+        val b = FloatArray(sr)
+        fresh.render(a, sr)
+        resumed.render(b, sr)
+        var sa = 0.0
+        var sb = 0.0
+        for (i in 0 until sr) { sa += a[i] * a[i]; sb += b[i] * b[i] }
+        assertTrue("retomar a los 50 s suena mucho más fuerte que empezar de cero", sb > sa * 100)
+    }
+
+    @Test
+    fun spokenTextAddsTheTimeOnlyIfAsked() {
+        val a = Alarm(id = 1, hour = 5, minute = 30, greetingText = "Buenos días", speakTime = true)
+        assertEquals("Buenos días. Son las 5 y 30.", a.spokenText())
+        assertEquals("Hola", a.copy(greetingText = "Hola", speakTime = false).spokenText())
+        assertEquals("Buenos días. Es la 1 en punto.", a.copy(hour = 1, minute = 0).spokenText())
+    }
 }
