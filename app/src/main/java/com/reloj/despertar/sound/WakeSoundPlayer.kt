@@ -10,12 +10,18 @@ import kotlin.math.max
  * Reproduce el sintetizador por AudioTrack en un hilo propio.
  * Solo existe mientras suena: no hay nada ejecutándose el resto del día (batería ≈ 0).
  */
-class WakeSoundPlayer(private val rampSeconds: Int) {
+class WakeSoundPlayer(
+    private val rampSeconds: Int,
+    private val preset: String = Sounds.DEFAULT,
+    private val offsetSeconds: Double = 0.0,
+) : RingSound {
     @Volatile private var stopRequested = false
     private var thread: Thread? = null
 
+    override fun isAlive(): Boolean = thread?.isAlive == true
+
     @Synchronized
-    fun start() {
+    override fun start() {
         if (thread != null) return
         stopRequested = false
         val t = Thread({ run() }, "wake-sound")
@@ -26,12 +32,20 @@ class WakeSoundPlayer(private val rampSeconds: Int) {
 
     /** No bloquea: el hilo hace un fundido de 0,2 s y se libera solo. */
     @Synchronized
-    fun stop() {
+    override fun stop() {
         stopRequested = true
         thread = null
     }
 
+    /** Si algo falla (p. ej. el audio del sistema), el hilo termina sin tumbar la app y el vigilante lo reinicia. */
     private fun run() {
+        try {
+            play()
+        } catch (_: Throwable) {
+        }
+    }
+
+    private fun play() {
         Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO)
         val minBuf = AudioTrack.getMinBufferSize(
             SAMPLE_RATE, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_FLOAT
@@ -54,7 +68,7 @@ class WakeSoundPlayer(private val rampSeconds: Int) {
             .setTransferMode(AudioTrack.MODE_STREAM)
             .build()
 
-        val synth = WakeSynth(rampSeconds.toDouble(), SAMPLE_RATE)
+        val synth = WakeSynth(rampSeconds.toDouble(), SAMPLE_RATE, preset, offsetSeconds)
         val buf = FloatArray(CHUNK)
         var fadeLeft = -1
         try {
